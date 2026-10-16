@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -18,7 +19,9 @@ type (
 		Builder     string
 		Platforms   []string
 		// Outputs maps a compose service name to the directory its OCI layout is exported to
-		Outputs    map[string]string
+		Outputs map[string]string
+		// OutputRoot is the directory all outputs are in; bake is allowed to write to it only
+		OutputRoot string
 		DockerHost string
 	}
 )
@@ -58,7 +61,8 @@ func BakeArgs(opts *BakeOptions) ([]string, error) {
 	if err := validateBakeOptions(opts); err != nil {
 		return nil, err
 	}
-	args := []string{"buildx", "bake", "--file", opts.ComposeFile, "--provenance=false"}
+	args := []string{"buildx", "bake", "--file", opts.ComposeFile, "--provenance=false",
+		"--allow=fs.write=" + opts.OutputRoot}
 	if len(opts.Builder) > 0 {
 		args = append(args, "--builder", opts.Builder)
 	}
@@ -91,6 +95,9 @@ func validateBakeOptions(opts *BakeOptions) error {
 			return err
 		}
 	}
+	if !filepath.IsAbs(opts.OutputRoot) || strings.ContainsAny(opts.OutputRoot, ",\"'\n") {
+		return fmt.Errorf("invalid output root directory: %q", opts.OutputRoot)
+	}
 	if len(opts.Outputs) == 0 {
 		return fmt.Errorf("no services to build")
 	}
@@ -99,7 +106,8 @@ func validateBakeOptions(opts *BakeOptions) error {
 			return fmt.Errorf("invalid compose service name: %q", svc)
 		}
 		// the output value is parsed by buildx as CSV, so a comma or quote would inject extra attributes
-		if len(dest) == 0 || strings.ContainsAny(dest, ",\"'\n") {
+		rel, err := filepath.Rel(opts.OutputRoot, dest)
+		if err != nil || strings.HasPrefix(rel, "..") || strings.ContainsAny(dest, ",\"'\n") {
 			return fmt.Errorf("invalid output directory for service %s: %q", svc, dest)
 		}
 	}

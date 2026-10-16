@@ -33,12 +33,14 @@ func TestBakeArgs(t *testing.T) {
 		Builder:     "composectl",
 		Platforms:   []string{"linux/amd64", "linux/arm64"},
 		Outputs:     map[string]string{"web": "/tmp/b/web", "api": "/tmp/b/api"},
+		OutputRoot:  "/tmp/b",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	expected := []string{
-		"buildx", "bake", "--file", "docker-compose.yml", "--provenance=false", "--builder", "composectl",
+		"buildx", "bake", "--file", "docker-compose.yml", "--provenance=false",
+		"--allow=fs.write=/tmp/b", "--builder", "composectl",
 		"--set", "api.platform=linux/amd64,linux/arm64",
 		"--set", "api.output=type=oci,tar=false,dest=/tmp/b/api",
 		"--set", "web.platform=linux/amd64,linux/arm64",
@@ -56,6 +58,7 @@ func TestBakeArgsRejectsInvalidInput(t *testing.T) {
 			ComposeFile: "docker-compose.yml",
 			Platforms:   []string{"linux/amd64"},
 			Outputs:     map[string]string{"web": "/tmp/b/web"},
+			OutputRoot:  "/tmp/b",
 		}
 	}
 	for name, mutate := range map[string]func(o *BakeOptions){
@@ -66,6 +69,8 @@ func TestBakeArgsRejectsInvalidInput(t *testing.T) {
 		"service name":         func(o *BakeOptions) { o.Outputs = map[string]string{"web.output=x": "/tmp/b"} },
 		"output with comma":    func(o *BakeOptions) { o.Outputs = map[string]string{"web": "/tmp/b,push=true"} },
 		"no services":          func(o *BakeOptions) { o.Outputs = nil },
+		"output outside root":  func(o *BakeOptions) { o.Outputs = map[string]string{"web": "/etc/web"} },
+		"relative output root": func(o *BakeOptions) { o.OutputRoot = "b" },
 	} {
 		opts := valid()
 		mutate(opts)
