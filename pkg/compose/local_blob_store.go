@@ -102,3 +102,22 @@ func readOCILayoutRoot(layoutDir string) (*ocispec.Descriptor, error) {
 	root.Annotations = nil
 	return &root, nil
 }
+
+// IndexPlatforms returns the platforms of the manifests listed in the image index stored under root.
+func (s *LocalBlobStore) IndexPlatforms(ctx context.Context, root *ocispec.Descriptor) ([]ocispec.Platform, error) {
+	b, err := content.ReadBlob(ctx, s.cs, *root)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read image index %s: %w", root.Digest, err)
+	}
+	var index ocispec.Index
+	if err := json.Unmarshal(b, &index); err != nil {
+		return nil, fmt.Errorf("failed to parse image index %s: %w", root.Digest, err)
+	}
+	var found []ocispec.Platform
+	for _, m := range index.Manifests {
+		if m.Platform != nil {
+			found = append(found, *m.Platform)
+		}
+	}
+	return found, nil
+}

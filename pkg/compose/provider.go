@@ -278,3 +278,22 @@ func (w *readCloserWrapper) Read(p []byte) (n int, err error) {
 func (w *readCloserWrapper) Close() error {
 	return w.closer.Close()
 }
+
+type fallbackBlobProvider struct {
+	BlobProvider
+	fallback BlobProvider
+}
+
+// NewFallbackBlobProvider returns a provider that reads blobs from the primary provider and,
+// if a blob is missing there, from the fallback one.
+func NewFallbackBlobProvider(primary BlobProvider, fallback BlobProvider) BlobProvider {
+	return &fallbackBlobProvider{BlobProvider: primary, fallback: fallback}
+}
+
+func (p *fallbackBlobProvider) GetReadCloser(ctx context.Context, opts ...SecureReadOptions) (io.ReadCloser, error) {
+	rc, err := p.BlobProvider.GetReadCloser(ctx, opts...)
+	if err != nil && ErrToBlobState(err) == BlobMissing {
+		return p.fallback.GetReadCloser(ctx, opts...)
+	}
+	return rc, err
+}
