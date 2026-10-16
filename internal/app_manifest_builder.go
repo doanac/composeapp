@@ -17,7 +17,7 @@ type (
 		// ArtifactType is the IANA media type of the artifact this schema refers to.
 		ArtifactType string `json:"artifactType,omitempty"`
 		// This field breaks the OCI image specification. It should be removed once all devices switch to version >= v93
-		Manifests  []distribution.Descriptor `json:"manifests,omitempty"`
+		Manifests []distribution.Descriptor `json:"manifests,omitempty"`
 	}
 	// BlobPutStatter is the subset of a blob store the app manifest builder needs,
 	// so the manifest can be built against a registry or a local content store.
@@ -26,14 +26,14 @@ type (
 		Put(ctx context.Context, mediaType string, p []byte) (distribution.Descriptor, error)
 	}
 	ManifestBuilder struct {
-		bs BlobPutStatter
+		bs       BlobPutStatter
 		manifest AppManifest
 	}
 )
 
 var (
 	AppManifestTemplate = AppManifest{
-		Manifest:     ocischema.Manifest{
+		Manifest: ocischema.Manifest{
 			Versioned: manifest.Versioned{
 				SchemaVersion: 2,
 				MediaType:     v1.MediaTypeImageManifest,
@@ -42,8 +42,8 @@ var (
 			// https://github.com/opencontainers/image-spec/blob/main/manifest.md#guidance-for-an-empty-descriptor
 			Config: distribution.Descriptor{
 				MediaType: v1.DescriptorEmptyJSON.MediaType,
-				Digest: v1.DescriptorEmptyJSON.Digest,
-				Size: v1.DescriptorEmptyJSON.Size,
+				Digest:    v1.DescriptorEmptyJSON.Digest,
+				Size:      v1.DescriptorEmptyJSON.Size,
 			},
 			Annotations: map[string]string{"compose-app": "v1"},
 		},
@@ -51,9 +51,9 @@ var (
 	}
 )
 
-func NewManifestBuilder(bs BlobPutStatter)  distribution.ManifestBuilder {
+func NewManifestBuilder(bs BlobPutStatter) distribution.ManifestBuilder {
 	return &ManifestBuilder{
-		bs: bs,
+		bs:       bs,
 		manifest: AppManifestTemplate,
 	}
 }
@@ -88,7 +88,7 @@ func (mb *ManifestBuilder) References() []distribution.Descriptor {
 	return mb.manifest.Layers
 }
 
-func (mb *ManifestBuilder) SetLayerMetaManifests(manifests []distribution.Descriptor)  {
+func (mb *ManifestBuilder) SetLayerMetaManifests(manifests []distribution.Descriptor) {
 	mb.manifest.Manifests = manifests
 }
 
