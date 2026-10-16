@@ -53,38 +53,64 @@ func loadProj(ctx context.Context, appName string, file string, content []byte) 
 	})
 }
 
-func DoPublish(ctx context.Context, appName string, file, target, digestFile string, dryRun bool, archList []string,
-	pinnedImages map[string]digest.Digest, layersMetaFile string, createAppLayersManifest bool) error {
+// ImageResolver pins the image of a compose service to a digest URI.
+type ImageResolver interface {
+	ResolveImage(ctx context.Context, svc types.ServiceConfig) (string, error)
+}
+
+type registryImageResolver struct {
+	regc         internal.RegistryClient
+	pinnedImages map[string]digest.Digest
+}
+
+// NewRegistryImageResolver returns a resolver that pins service images to the digests
+// their tags refer to in a container registry.
+func NewRegistryImageResolver(pinnedImages map[string]digest.Digest) ImageResolver {
+	return &registryImageResolver{regc: internal.NewRegistryClient(), pinnedImages: pinnedImages}
+}
+
+// LoadAndPinApp reads a compose project file and returns its YAML config with every service
+// image pinned by the resolver and every service labeled with the hash of its config.
+func LoadAndPinApp(ctx context.Context, appName string, file string,
+	resolver ImageResolver) (map[string]interface{}, error) {
 	b, err := os.ReadFile(file)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to read compose file: %w", err)
 	}
 	config, err := loader.ParseYAML(b)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to parse compose file: %w", err)
 	}
-
 	proj, err := loadProj(ctx, appName, file, b)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to load compose project: %w", err)
+	}
+	svcs, ok := config["services"].(map[string]interface{})
+	if !ok {
+		return nil, errors.New("Unable to find 'services' section of composetypes file")
 	}
 
 	fmt.Println("= Pinning service images...")
-	svcs, ok := config["services"]
-	if !ok {
-		return errors.New("Unable to find 'services' section of composetypes file")
+	if err := pinServiceImages(ctx, svcs, proj, resolver); err != nil {
+		return nil, err
 	}
-	if err := pinServiceImages(ctx, svcs.(map[string]interface{}), proj, pinnedImages); err != nil {
-		return err
-	}
-
 	fmt.Println("== Hashing services...")
-	if err := pinServiceConfigs(svcs.(map[string]interface{}), proj); err != nil {
+	if err := pinServiceConfigs(svcs, proj); err != nil {
+		return nil, err
+	}
+	return config, nil
+}
+
+func DoPublish(ctx context.Context, appName string, file, target, digestFile string, dryRun bool, archList []string,
+	pinnedImages map[string]digest.Digest, layersMetaFile string, createAppLayersManifest bool) error {
+	config, err := LoadAndPinApp(ctx, appName, file, NewRegistryImageResolver(pinnedImages))
+	if err != nil {
 		return err
 	}
+	svcs := config["services"].(map[string]interface{})
 
 	fmt.Println("= Getting app layers metadata...")
-	appLayers, err := compose.GetLayers(ctx, svcs.(map[string]interface{}), archList)
+	appLayers, err := compose.GetLayers(ctx, svcs, archList)
 	if err != nil {
 		return err
 	}
@@ -137,27 +163,110 @@ func iterateServices(services map[string]interface{}, proj *types.Project, fn ty
 	})
 }
 
+// AppBundle is a pinned compose project together with the app archive made of it
+// and the project's supporting files.
+type AppBundle struct {
+	Compose       []byte
+	Archive       []byte
+	ContentHashes map[string]string
+}
+
+// NewAppBundle archives the current directory, replacing its compose file with the pinned config.
+func NewAppBundle(config map[string]interface{}) (*AppBundle, error) {
+	pinned, err := yaml.Marshal(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal pinned compose: %w", err)
+	}
+	fmt.Printf("  |-> pinned content hash: %x\n", sha256.Sum256(pinned))
+
+	buff, appContentHashes, err := createTgz(pinned, "./")
+	if err != nil {
+		return nil, err
+	}
+	fmt.Printf("  |-> app archive hash: %x\n", sha256.Sum256(buff))
+	return &AppBundle{Compose: pinned, Archive: buff, ContentHashes: appContentHashes}, nil
+}
+
+// BuildAppManifest stores the app bundle, its index and the optional layers metadata in the given
+// blob store and returns the app manifest referring to them.
+func BuildAppManifest(ctx context.Context, blobStore internal.BlobPutStatter, bundle *AppBundle,
+	layerManifests []distribution.Descriptor, appLayersMetaData []byte) (*ocischema.DeserializedManifest, error) {
+	desc, err := putAppBundle(ctx, blobStore, bundle)
+	if err != nil {
+		return nil, err
+	}
+	mb := internal.NewManifestBuilder(blobStore)
+	if err := mb.AppendReference(desc); err != nil {
+		return nil, err
+	}
+	if appLayersMetaData != nil {
+		d, err := blobStore.Put(ctx, "application/json", appLayersMetaData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to put App layers meta to the App blob store: %s", err.Error())
+		}
+		d.Annotations = map[string]string{"layers-meta": "v1"}
+		if err := mb.AppendReference(d); err != nil {
+			return nil, fmt.Errorf("failed to add App layers meta descriptor to the App manifest: %s", err.Error())
+		}
+		fmt.Println("  |-> app layers meta: ", d.Digest.String())
+	}
+	if layerManifests != nil {
+		mb.(*internal.ManifestBuilder).SetLayerMetaManifests(layerManifests)
+	}
+
+	manifest, err := mb.Build(ctx)
+	if err != nil {
+		return nil, err
+	}
+	man, ok := manifest.(*ocischema.DeserializedManifest)
+	if !ok {
+		return nil, fmt.Errorf("invalid manifest type, expected *ocischema.DeserializedManifest, got: %T", manifest)
+	}
+	_, b, err := man.Payload()
+	if err != nil {
+		return nil, err
+	}
+	fmt.Printf("  |-> manifest size: %d\n", len(b))
+	if len(b) >= AppManifestMaxSize {
+		return nil, fmt.Errorf("app manifest size (%d) exceeds the maximum size limit (%d)", len(b), AppManifestMaxSize)
+	}
+	return man, nil
+}
+
+func putAppBundle(ctx context.Context, blobStore internal.BlobPutStatter,
+	bundle *AppBundle) (distribution.Descriptor, error) {
+	desc, err := blobStore.Put(ctx, AppLayerMediaType, bundle.Archive)
+	if err != nil {
+		return desc, err
+	}
+	// enforce App's layer media type to make sure it is the same regardless container registry service
+	// (some container registries changes the media type specified by a client)
+	desc.MediaType = AppLayerMediaType
+	fmt.Println("  |-> app blob: ", desc.Digest.String())
+
+	if os.Getenv("APP_BUNDLE_INDEX_OFF") != "1" && len(bundle.ContentHashes) > 0 {
+		if d, err := publishAppBundleIndexBlob(ctx, blobStore, bundle.ContentHashes); err == nil {
+			desc.Annotations = map[string]string{
+				AnnotationKeyAppBundleIndexDigest: d.Digest.String(),
+				AnnotationKeyAppBundleIndexSize:   strconv.Itoa(int(d.Size)),
+			}
+			fmt.Println("  |-> app index: ", d.Digest.String())
+		} else {
+			fmt.Println("  |-> failed to publish app index blob: ", err.Error())
+		}
+	}
+	return desc, nil
+}
+
 func createAndPublishApp(ctx context.Context,
 	config map[string]interface{},
 	target string, dryRun bool,
 	layerManifests []distribution.Descriptor,
 	appLayersMetaData []byte) (string, error) {
-	pinned, err := yaml.Marshal(config)
+	bundle, err := NewAppBundle(config)
 	if err != nil {
 		return "", err
 	}
-
-	pinnedHash := sha256.Sum256(pinned)
-	fmt.Printf("  |-> pinned content hash: %x\n", pinnedHash)
-
-	var appContentHashes map[string]string
-	buff, appContentHashes, err := createTgz(pinned, "./")
-	if err != nil {
-		return "", err
-	}
-
-	archHash := sha256.Sum256(buff)
-	fmt.Printf("  |-> app archive hash: %x\n", archHash)
 
 	named, err := reference.ParseNormalizedNamed(target)
 	if err != nil {
@@ -176,76 +285,17 @@ func createAndPublishApp(ctx context.Context,
 
 	if dryRun {
 		fmt.Println("Pinned compose:")
-		fmt.Println(string(pinned))
+		fmt.Println(string(bundle.Compose))
 		fmt.Println("Skipping publishing for dryrun")
-
-		if err := os.WriteFile("/tmp/compose-bundle.tgz", buff, 0755); err != nil {
+		if err := os.WriteFile("/tmp/compose-bundle.tgz", bundle.Archive, 0755); err != nil {
 			return "", err
 		}
-
 		return "", nil
 	}
 
-	blobStore := repo.Blobs(ctx)
-	desc, err := blobStore.Put(ctx, AppLayerMediaType, buff)
+	man, err := BuildAppManifest(ctx, repo.Blobs(ctx), bundle, layerManifests, appLayersMetaData)
 	if err != nil {
 		return "", err
-	}
-	// enforce App's layer media type to make sure it is the same regardless container registry service
-	// (some container registries changes the media type specified by a client)
-	desc.MediaType = AppLayerMediaType
-	fmt.Println("  |-> app blob: ", desc.Digest.String())
-
-	if os.Getenv("APP_BUNDLE_INDEX_OFF") != "1" && appContentHashes != nil && len(appContentHashes) > 0 {
-		if d, err := publishAppBundleIndexBlob(ctx, blobStore, appContentHashes); err == nil {
-			desc.Annotations = map[string]string{
-				AnnotationKeyAppBundleIndexDigest: d.Digest.String(),
-				AnnotationKeyAppBundleIndexSize:   strconv.Itoa(int(d.Size)),
-			}
-			fmt.Println("  |-> app index: ", d.Digest.String())
-		} else {
-			fmt.Println("  |-> failed to publish app index blob: ", err.Error())
-		}
-	}
-
-	mb := internal.NewManifestBuilder(blobStore)
-	if err := mb.AppendReference(desc); err != nil {
-		return "", err
-	}
-
-	if appLayersMetaData != nil {
-		if d, err := blobStore.Put(ctx, "application/json", appLayersMetaData); err == nil {
-			d.Annotations = map[string]string{"layers-meta": "v1"}
-			if err := mb.AppendReference(d); err != nil {
-				return "", fmt.Errorf("failed to add App layers meta descriptor to the App manifest: %s", err.Error())
-			}
-			fmt.Println("  |-> app layers meta: ", d.Digest.String())
-		} else {
-			return "", fmt.Errorf("failed to put App layers meta to the App blob store: %s", err.Error())
-		}
-	}
-
-	if layerManifests != nil {
-		mb.(*internal.ManifestBuilder).SetLayerMetaManifests(layerManifests)
-	}
-
-	manifest, err := mb.Build(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	man, ok := manifest.(*ocischema.DeserializedManifest)
-	if !ok {
-		return "", fmt.Errorf("invalid manifest type, expected *ocischema.DeserializedManifest, got: %T", manifest)
-	}
-	_, b, err := man.Payload()
-	if err != nil {
-		return "", err
-	}
-
-	fmt.Printf("  |-> manifest size: %d\n", len(b))
-	if len(b) >= AppManifestMaxSize {
-		return "", fmt.Errorf("app manifest size (%d) exceeds the maximum size limit (%d)", len(b), AppManifestMaxSize)
 	}
 	svc, err := repo.Manifests(ctx, nil)
 	if err != nil {
@@ -360,87 +410,90 @@ func getIgnores(appDir string) []string {
 func pinServiceImages(ctx context.Context,
 	services map[string]interface{},
 	proj *types.Project,
-	pinnedImages map[string]digest.Digest) error {
-	regc := internal.NewRegistryClient()
-
+	resolver ImageResolver) error {
 	return iterateServices(services, proj, func(s types.ServiceConfig) error {
-		name := s.Name
-		obj := services[name]
-		svc := obj.(map[string]interface{})
-
-		image := s.Image
-		if len(image) == 0 {
-			return fmt.Errorf("Service(%s) missing 'image' attribute", name)
-		}
+		svc := services[s.Name].(map[string]interface{})
 		if s.Build != nil {
-			fmt.Printf("Removing service(%s) 'build' stanza\n", name)
+			fmt.Printf("Removing service(%s) 'build' stanza\n", s.Name)
 			delete(svc, "build")
 		}
-
-		fmt.Printf("Pinning %s(%s)\n", name, image)
-		named, err := reference.ParseNormalizedNamed(image)
+		pinned, err := resolver.ResolveImage(ctx, s)
 		if err != nil {
 			return err
 		}
-
-		repo, err := regc.GetRepository(ctx, named)
-		if err != nil {
-			return err
-		}
-
-		var digest digest.Digest
-		switch v := named.(type) {
-		case reference.Tagged:
-			tag := v.Tag()
-			desc, err := repo.Tags(ctx).Get(ctx, tag)
-			if err != nil {
-				return fmt.Errorf("Unable to find image reference(%s): %s", image, err)
-			}
-			digest = desc.Digest
-		case reference.Digested:
-			digest = v.Digest()
-		default:
-			var ok bool
-			if digest, ok = pinnedImages[named.Name()]; !ok {
-				return fmt.Errorf("Invalid reference type for %s: %T. Images must be pinned to a `:<tag>` or `@sha256:<hash>`", named, named)
-			}
-		}
-
-		mansvc, err := repo.Manifests(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("Unable to get image manifests(%s): %s", image, err)
-		}
-		man, err := mansvc.Get(ctx, digest)
-		if err != nil {
-			return fmt.Errorf("Unable to find image manifest(%s): %s", image, err)
-		}
-
-		// TODO - we should find the intersection of platforms so
-		// that we can denote the platforms this app can run on
-		pinned := reference.Domain(named) + "/" + reference.Path(named) + "@" + digest.String()
-
-		switch mani := man.(type) {
-		case *manifestlist.DeserializedManifestList:
-			fmt.Printf("  | ")
-			for i, m := range mani.Manifests {
-				if i != 0 {
-					fmt.Printf(", ")
-				}
-				fmt.Printf(m.Platform.Architecture)
-				if m.Platform.Architecture == "arm" {
-					fmt.Printf(m.Platform.Variant)
-				}
-			}
-		case *schema2.DeserializedManifest:
-			break
-		default:
-			return fmt.Errorf("Unexpected manifest: %v", mani)
-		}
-
 		fmt.Println("\n  |-> ", pinned)
 		svc["image"] = pinned
 		return nil
 	})
+}
+
+func (r *registryImageResolver) ResolveImage(ctx context.Context, s types.ServiceConfig) (string, error) {
+	image := s.Image
+	if len(image) == 0 {
+		return "", fmt.Errorf("Service(%s) missing 'image' attribute", s.Name)
+	}
+	fmt.Printf("Pinning %s(%s)\n", s.Name, image)
+	named, err := reference.ParseNormalizedNamed(image)
+	if err != nil {
+		return "", err
+	}
+	repo, err := r.regc.GetRepository(ctx, named)
+	if err != nil {
+		return "", err
+	}
+
+	var digest digest.Digest
+	switch v := named.(type) {
+	case reference.Tagged:
+		desc, err := repo.Tags(ctx).Get(ctx, v.Tag())
+		if err != nil {
+			return "", fmt.Errorf("Unable to find image reference(%s): %s", image, err)
+		}
+		digest = desc.Digest
+	case reference.Digested:
+		digest = v.Digest()
+	default:
+		var ok bool
+		if digest, ok = r.pinnedImages[named.Name()]; !ok {
+			return "", fmt.Errorf("Invalid reference type for %s: %T. Images must be pinned to a `:<tag>` or `@sha256:<hash>`", named, named)
+		}
+	}
+
+	mansvc, err := repo.Manifests(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("Unable to get image manifests(%s): %s", image, err)
+	}
+	man, err := mansvc.Get(ctx, digest)
+	if err != nil {
+		return "", fmt.Errorf("Unable to find image manifest(%s): %s", image, err)
+	}
+	if err := printManifestPlatforms(man); err != nil {
+		return "", err
+	}
+	// TODO - we should find the intersection of platforms so
+	// that we can denote the platforms this app can run on
+	return reference.Domain(named) + "/" + reference.Path(named) + "@" + digest.String(), nil
+}
+
+func printManifestPlatforms(man distribution.Manifest) error {
+	switch mani := man.(type) {
+	case *manifestlist.DeserializedManifestList:
+		fmt.Printf("  | ")
+		for i, m := range mani.Manifests {
+			if i != 0 {
+				fmt.Printf(", ")
+			}
+			fmt.Printf(m.Platform.Architecture)
+			if m.Platform.Architecture == "arm" {
+				fmt.Printf(m.Platform.Variant)
+			}
+		}
+	case *schema2.DeserializedManifest:
+		break
+	default:
+		return fmt.Errorf("Unexpected manifest: %v", mani)
+	}
+	return nil
 }
 
 func pinServiceConfigs(services map[string]interface{}, proj *types.Project) error {
@@ -466,7 +519,7 @@ func pinServiceConfigs(services map[string]interface{}, proj *types.Project) err
 
 func publishAppBundleIndexBlob(
 	ctx context.Context,
-	blobStore distribution.BlobStore,
+	blobStore internal.BlobPutStatter,
 	appContentHashes map[string]string) (desc distribution.Descriptor, err error) {
 	var b []byte
 	if b, err = json.Marshal(appContentHashes); err == nil {

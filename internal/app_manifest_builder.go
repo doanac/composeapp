@@ -19,8 +19,14 @@ type (
 		// This field breaks the OCI image specification. It should be removed once all devices switch to version >= v93
 		Manifests  []distribution.Descriptor `json:"manifests,omitempty"`
 	}
+	// BlobPutStatter is the subset of a blob store the app manifest builder needs,
+	// so the manifest can be built against a registry or a local content store.
+	BlobPutStatter interface {
+		distribution.BlobStatter
+		Put(ctx context.Context, mediaType string, p []byte) (distribution.Descriptor, error)
+	}
 	ManifestBuilder struct {
-		bs distribution.BlobService
+		bs BlobPutStatter
 		manifest AppManifest
 	}
 )
@@ -45,7 +51,7 @@ var (
 	}
 )
 
-func NewManifestBuilder(bs distribution.BlobService)  distribution.ManifestBuilder {
+func NewManifestBuilder(bs BlobPutStatter)  distribution.ManifestBuilder {
 	return &ManifestBuilder{
 		bs: bs,
 		manifest: AppManifestTemplate,
