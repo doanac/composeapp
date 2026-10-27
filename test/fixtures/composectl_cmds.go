@@ -483,3 +483,39 @@ func randomString(length int) string {
 	}
 	return string(b)
 }
+
+// Build builds the app with `composectl build` into the given store and sets the app URI.
+// It builds on the publisher dockerd, as the CI would, so the buildx builder it leaves behind
+// does not show up among the images of the device dockerd.
+func (a *App) Build(t *testing.T, storeRoot string, archs string) {
+	t.Helper()
+	t.Run("build app", func(t *testing.T) {
+		digestFile := path.Join(a.Dir, "digest.sha256")
+		baseUri := "hub.example.com/factory/" + a.Name
+		runCmd(t, a.Dir, "-H", os.Getenv("PUBLISHER_DOCKER_HOST"), "-s", storeRoot,
+			"build", "-d", digestFile, baseUri+":"+randomString(7), archs)
+		b, err := os.ReadFile(digestFile)
+		Check(t, err)
+		a.PublishedUri = baseUri + "@" + string(b)
+		fmt.Printf("built app uri: %s\n", a.PublishedUri)
+	})
+}
+
+// CheckFetchedIn checks that all app blobs for the given arch are in the given store.
+func (a *App) CheckFetchedIn(t *testing.T, storeRoot string, arch string) {
+	t.Helper()
+	t.Run("check app for "+arch, func(t *testing.T) {
+		output := runCmd(t, a.Dir, "-s", storeRoot, "-a", arch, "check", "--local", a.PublishedUri, "--format", "json")
+		checkResult := composectl.CheckAndInstallResult{}
+		Check(t, json.Unmarshal(output, &checkResult))
+		if len(checkResult.FetchCheck.MissingBlobs) > 0 {
+			t.Errorf("there are missing app blobs for %s: %+v\n", arch, checkResult.FetchCheck.MissingBlobs)
+		}
+	})
+}
+
+// PullFromStore pulls the app from another app store instead of a registry.
+func (a *App) PullFromStore(t *testing.T, srcStoreRoot string) {
+	t.Helper()
+	a.runCmd(t, "pull app from store", "pull", a.PublishedUri, "-u", "90", "-l", srcStoreRoot)
+}
